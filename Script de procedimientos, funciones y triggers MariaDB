@@ -1,0 +1,404 @@
+DELIMITER //
+
+
+CREATE OR REPLACE FUNCTION generatePassword() RETURNS VARCHAR(20)
+NOT DETERMINISTIC
+BEGIN
+    DECLARE generated_password VARCHAR(20) DEFAULT '';
+    DECLARE first_letter CHAR(1) DEFAULT '';
+    DECLARE second_digit CHAR(1) DEFAULT '';
+    DECLARE third_special_symbol CHAR(1) DEFAULT '';
+    DECLARE alphanumeric VARCHAR(4) DEFAULT '';
+    DECLARE others VARCHAR(12) DEFAULT '';
+    DECLARE symbols VARCHAR(20) DEFAULT '+$#()-!{}{[]}';
+    DECLARE i INT DEFAULT 0;
+    DECLARE len INT DEFAULT 0;
+    DECLARE total_len INT DEFAULT 0;
+    -- Letra mayúscula (A-Z)
+    SET first_letter = CHAR(FLOOR(RAND() * 26) + 65);
+    -- Dígito (0-9)
+    SET second_digit = CHAR(FLOOR(RAND() * 10) + 48);
+    -- Símbolo especial
+    SET i = FLOOR(RAND() * CHAR_LENGTH(symbols)) + 1;
+    SET third_special_symbol = SUBSTRING(symbols, i, 1)
+    -- 4 caracteres alfanuméricos (pueden ser letras o números)
+    SET alphanumeric = '';
+    SET i = 0;
+    WHILE i < 4 DO
+        -- 50% probabilidad de letra minúscula, 50% de número
+        IF RAND() < 0.5 THEN
+            SET alphanumeric = CONCAT(alphanumeric, CHAR(FLOOR(RAND() * 26) + 97));
+        ELSE
+            SET alphanumeric = CONCAT(alphanumeric, CHAR(FLOOR(RAND() * 10) + 48));
+        END IF;
+        SET i = i + 1;
+    END WHILE;
+    -- Longitud total entre 8 y 20 caracteres
+    SET total_len = FLOOR(RAND() * 13) + 8;
+    
+    -- Caracteres adicionales para completar la longitud
+    SET others = '';
+    SET len = total_len - 7; -- Ya tenemos 7 caracteres (1 letra, 1 digito, 1 simbolo, 4 alfanum)
+    
+    IF len > 0 THEN
+        SET i = 0;
+        WHILE i < len DO
+            -- 70% probabilidad de letra minúscula, 20% mayúscula, 10% número
+            DECLARE rand_val DECIMAL(10,2) DEFAULT RAND();
+            IF rand_val < 0.7 THEN
+                SET others = CONCAT(others, CHAR(FLOOR(RAND() * 26) + 97));
+            ELSEIF rand_val < 0.9 THEN
+                SET others = CONCAT(others, CHAR(FLOOR(RAND() * 26) + 65));
+            ELSE
+                SET others = CONCAT(others, CHAR(FLOOR(RAND() * 10) + 48));
+            END IF;
+            SET i = i + 1;
+        END WHILE;
+    END IF;
+    
+    -- Concatenar componentes
+    SET generated_password = CONCAT(first_letter, second_digit, third_special_symbol, alphanumeric, others);
+    
+    -- Asegurar que no exceda 20 caracteres
+    RETURN SUBSTRING(generated_password, 1, 20);
+END;
+//
+
+DELIMITER ;
+
+
+CREATE DATABASE IF NOT EXISTS rh CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+
+USE rh;
+
+CREATE TABLE IF NOT EXISTS empleados (
+    id_empleado INT PRIMARY KEY,
+    nombre VARCHAR(100) NOT NULL,
+    salario DECIMAL(10,2) CHECK (salario >= 0),
+    fecha_contratacion DATE DEFAULT CURRENT_DATE,
+    departamento VARCHAR(50),
+    contrasena VARCHAR(20) DEFAULT generatePassword(),
+    activo BOOLEAN DEFAULT TRUE
+);
+
+CREATE TABLE IF NOT EXISTS auditoria_cambios (
+    id_auditoria INT AUTO_INCREMENT PRIMARY KEY,
+    tabla_afectada VARCHAR(50) NOT NULL,
+    operacion VARCHAR(10) NOT NULL,
+    usuario_bd VARCHAR(30) NOT NULL,
+    fecha_operacion TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    id_registro VARCHAR(100) NOT NULL,
+    valor_anterior TEXT,
+    valor_nuevo TEXT,
+    ip_conexion VARCHAR(45)
+);DELIMITER //
+
+-- Procedimiento para agregar empleados con validación
+CREATE OR REPLACE PROCEDURE agregar_empleado(
+    IN p_id INT,
+    IN p_nombre VARCHAR(255),
+    IN p_salario DECIMAL(10,2),
+    IN p_departamento VARCHAR(50) DEFAULT NULL,
+    IN p_fecha_contratacion DATE DEFAULT NULL
+)
+BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        ROLLBACK;
+        SIGNAL SQLSTATE '45000' 
+        SET MESSAGE_TEXT = 'Error al agregar empleado';
+    END;
+    
+    START TRANSACTION;
+    
+    IF p_salario < 0 THEN
+        SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT = 'El salario no puede ser negativo';
+    ELSEIF p_salario < 5000 OR p_salario > 30000 THEN
+        SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT = 'Salario fuera del rango permitido (5000-30000)';
+    ELSE
+        INSERT INTO empleados (id_empleado, nombre, salario, departamento, fecha_contratacion)
+        VALUES (p_id, p_nombre, p_salario, p_departamento, 
+               COALESCE(p_fecha_contratacion, CURRENT_DATE));
+        
+        COMMIT;
+        SELECT CONCAT('Empleado ', p_nombre, ' agregado correctamente') AS mensaje;
+    END IF;
+END;
+//
+
+-- Procedimiento para actualizar salarios
+CREATE OR REPLACE PROCEDURE actualizar_salario(
+    IN p_id_empleado INT,
+    IN p_aumento DECIMAL(10,2),
+    IN p_porcentaje BOOLEAN DEFAULT FALSE
+)
+BEGIN
+    DECLARE v_salario_actual DECIMAL(10,2);
+    DECLARE v_nuevo_salario DECIMAL(10,2);
+    
+    START TRANSACTION;
+    
+    -- Obtener salario actual
+    SELECT salario INTO v_salario_actual
+    FROM empleados
+    WHERE id_empleado = p_id_empleado;
+    
+    IF v_salario_actual IS NULL THEN
+        SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT = 'Empleado no encontrado';
+    END IF;
+    
+    -- Calcular nuevo salario
+    IF p_porcentaje THEN
+        SET v_nuevo_salario = v_salario_actual * (1 + p_aumento/100);
+    ELSE
+        SET v_nuevo_salario = v_salario_actual + p_aumento;
+    END IF;
+    
+    -- Validar nuevo salario
+    IF v_nuevo_salario < 0 THEN
+        SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT = 'El salario no puede ser negativo';
+    END IF;
+    
+    -- Actualizar salario
+    UPDATE empleados
+    SET salario = v_nuevo_salario
+    WHERE id_empleado = p_id_empleado;
+    
+    COMMIT;
+    SELECT CONCAT('Salario actualizado a ', v_nuevo_salario) AS mensaje;
+END;
+//
+
+-- Procedimiento para listar empleados
+CREATE OR REPLACE PROCEDURE listar_empleados(
+    IN p_departamento VARCHAR(50) DEFAULT NULL,
+    IN p_salario_min DECIMAL(10,2) DEFAULT 0,
+    IN p_salario_max DECIMAL(10,2) DEFAULT 30000
+)
+BEGIN
+    IF p_departamento IS NULL THEN
+        SELECT id_empleado, nombre, salario, departamento, fecha_contratacion
+        FROM empleados
+        WHERE salario BETWEEN p_salario_min AND p_salario_max
+        AND activo = TRUE
+        ORDER BY nombre;
+    ELSE
+        SELECT id_empleado, nombre, salario, departamento, fecha_contratacion
+        FROM empleados
+        WHERE departamento = p_departamento
+        AND salario BETWEEN p_salario_min AND p_salario_max
+        AND activo = TRUE
+        ORDER BY nombre;
+    END IF;
+END;
+//
+
+DELIMITER ;
+
+DELIMITER //
+
+-- Trigger para auditoría de inserciones (mejorado)
+CREATE OR REPLACE TRIGGER trg_auditoria_empleados_insert
+AFTER INSERT ON empleados
+FOR EACH ROW
+BEGIN
+    INSERT INTO auditoria_cambios (
+        tabla_afectada,
+        operacion,
+        usuario_bd,
+        id_registro,
+        valor_anterior,
+        valor_nuevo,
+        ip_conexion
+    )
+    VALUES (
+        'EMPLEADOS',
+        'INSERT',
+        CURRENT_USER(),
+        NEW.id_empleado,
+        NULL,
+        CONCAT('Nombre: ', NEW.nombre, 
+              ', Salario: ', NEW.salario,
+              ', Depto: ', COALESCE(NEW.departamento, 'N/A'),
+        COALESCE(@remote_ip, 'Desconocida')
+    );
+END;
+//
+
+-- Trigger para auditoría de actualizaciones (mejorado)
+CREATE OR REPLACE TRIGGER trg_auditoria_empleados_update
+AFTER UPDATE ON empleados
+FOR EACH ROW
+BEGIN
+    IF OLD.nombre != NEW.nombre OR OLD.salario != NEW.salario OR 
+       OLD.departamento != NEW.departamento OR OLD.activo != NEW.activo THEN
+        INSERT INTO auditoria_cambios (
+            tabla_afectada,
+            operacion,
+            usuario_bd,
+            id_registro,
+            valor_anterior,
+            valor_nuevo,
+            ip_conexion
+        )
+        VALUES (
+            'EMPLEADOS',
+            'UPDATE',
+            CURRENT_USER(),
+            NEW.id_empleado,
+            CONCAT('Nombre: ', OLD.nombre, 
+                  ', Salario: ', OLD.salario,
+                  ', Depto: ', COALESCE(OLD.departamento, 'N/A'),
+                  ', Activo: ', IF(OLD.activo, 'Sí', 'No')),
+            CONCAT('Nombre: ', NEW.nombre, 
+                  ', Salario: ', NEW.salario,
+                  ', Depto: ', COALESCE(NEW.departamento, 'N/A'),
+                  ', Activo: ', IF(NEW.activo, 'Sí', 'No')),
+            COALESCE(@remote_ip, 'Desconocida')
+        );
+    END IF;
+END;
+//
+
+-- Trigger para auditoría de eliminaciones (mejorado)
+CREATE OR REPLACE TRIGGER trg_auditoria_empleados_delete
+AFTER DELETE ON empleados
+FOR EACH ROW
+BEGIN
+    INSERT INTO auditoria_cambios (
+        tabla_afectada,
+        operacion,
+        usuario_bd,
+        id_registro,
+        valor_anterior,
+        valor_nuevo,
+        ip_conexion
+    )
+    VALUES (
+        'EMPLEADOS',
+        'DELETE',
+        CURRENT_USER(),
+        OLD.id_empleado,
+        CONCAT('Nombre: ', OLD.nombre, 
+              ', Salario: ', OLD.salario,
+              ', Depto: ', COALESCE(OLD.departamento, 'N/A'),
+              ', Activo: ', IF(OLD.activo, 'Sí', 'No')),
+        NULL,
+        COALESCE(@remote_ip, 'Desconocida')
+    );
+END;
+//
+
+-- Trigger para validar salario antes de insertar o actualizar
+CREATE OR REPLACE TRIGGER trg_validar_salario
+BEFORE INSERT OR UPDATE ON empleados
+FOR EACH ROW
+BEGIN
+    IF NEW.salario < 0 THEN
+        SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT = 'El salario no puede ser negativo';
+    END IF;
+END;
+//
+
+-- Trigger para generar contraseña al insertar
+CREATE OR REPLACE TRIGGER trg_generar_contrasena
+BEFORE INSERT ON empleados
+FOR EACH ROW
+BEGIN
+    IF NEW.contrasena IS NULL THEN
+        SET NEW.contrasena = generatePassword();
+    END IF;
+END;
+//
+
+DELIMITER ;
+
+DELIMITER //
+
+-- Función para calcular el salario anual
+CREATE OR REPLACE FUNCTION calcular_salario_anual(p_id_empleado INT) 
+RETURNS DECIMAL(10,2)
+DETERMINISTIC
+READS SQL DATA
+BEGIN
+    DECLARE v_salario DECIMAL(10,2);
+    
+    SELECT salario INTO v_salario
+    FROM empleados
+    WHERE id_empleado = p_id_empleado;
+    
+    IF v_salario IS NULL THEN
+        RETURN NULL;
+    ELSE
+        RETURN v_salario * 12;
+    END IF;
+END;
+//
+
+-- Función para verificar si un empleado existe
+CREATE OR REPLACE FUNCTION empleado_existe(p_id_empleado INT) 
+RETURNS BOOLEAN
+DETERMINISTIC
+READS SQL DATA
+BEGIN
+    DECLARE v_count INT;
+    
+    SELECT COUNT(*) INTO v_count
+    FROM empleados
+    WHERE id_empleado = p_id_empleado;
+    
+    RETURN v_count > 0;
+END;
+//
+
+-- Función para obtener información del empleado
+CREATE OR REPLACE FUNCTION obtener_info_empleado(p_id_empleado INT) 
+RETURNS TEXT
+DETERMINISTIC
+READS SQL DATA
+BEGIN
+    DECLARE v_info TEXT;
+    
+    SELECT CONCAT(
+        'ID: ', id_empleado,
+        ', Nombre: ', nombre,
+        ', Salario: ', salario,
+        ', Departamento: ', COALESCE(departamento, 'N/A'),
+        ', Fecha Contratación: ', fecha_contratacion
+    ) INTO v_info
+    FROM empleados
+    WHERE id_empleado = p_id_empleado;
+    
+    RETURN v_info;
+END;
+//
+
+DELIMITER ;
+-- Agregar empleados
+CALL agregar_empleado(1, 'Ambrosio Cardoso Jimenez', 10000, 'TI');
+CALL agregar_empleado(2, 'Juan Climaco Rubio Cosme', 15000, 'Ventas');
+CALL agregar_empleado(3, 'Rosa Lujan Martínez', 12000, 'RH');
+
+-- Intentar agregar empleado con salario inválido (esto fallará)
+CALL agregar_empleado(4, 'Alienigena', -5000);
+
+-- Actualizar salarios
+CALL actualizar_salario(1, 2000); -- Aumento fijo
+CALL actualizar_salario(2, 10, TRUE); -- Aumento porcentual (10%)
+
+-- Listar empleados
+CALL listar_empleados(); -- Todos los empleados
+CALL listar_empleados('TI'); -- Solo empleados de TI
+
+-- Usar funciones
+SELECT calcular_salario_anual(1) AS salario_anual;
+SELECT empleado_existe(1) AS existe;
+SELECT obtener_info_empleado(1) AS info_empleado;
+
+-- Ver auditoría
+SELECT * FROM auditoria_cambios ORDER BY fecha_operacion DESC;
