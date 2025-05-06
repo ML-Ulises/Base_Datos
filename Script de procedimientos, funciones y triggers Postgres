@@ -1,0 +1,386 @@
+CREATE OR REPLACE FUNCTION generate_password()
+RETURNS VARCHAR(20) AS $$
+DECLARE
+    generated_password VARCHAR(20) := '';
+    first_letter CHAR(1) := '';
+    second_digit CHAR(1) := '';
+    third_special_symbol CHAR(1) := '';
+    alphanumeric VARCHAR(4) := '';
+    others VARCHAR(12) := '';
+    symbols VARCHAR(20) := '+$#()-!{}{[]}';
+    i INT := 0;
+    len INT := 0;
+    total_len INT := 0;
+BEGIN
+    -- Letra mayúscula (A-Z)
+    first_letter := CHR(FLOOR(RANDOM() * 26)::INT + 65);
+    
+    -- Dígito (0-9)
+    second_digit := CHR(FLOOR(RANDOM() * 10)::INT + 48);
+    
+    -- Símbolo especial
+    i := FLOOR(RANDOM() * LENGTH(symbols))::INT + 1;
+    third_special_symbol := SUBSTRING(symbols FROM i FOR 1);
+    
+    -- 4 caracteres alfanuméricos
+    alphanumeric := '';
+    FOR i IN 1..4 LOOP
+        IF RANDOM() < 0.5 THEN
+            alphanumeric := alphanumeric || CHR(FLOOR(RANDOM() * 26)::INT + 97);
+        ELSE
+            alphanumeric := alphanumeric || CHR(FLOOR(RANDOM() * 10)::INT + 48);
+        END IF;
+    END LOOP;
+    
+    -- Longitud total entre 8 y 20 caracteres
+    total_len := FLOOR(RANDOM() * 13)::INT + 8;
+    
+    -- Caracteres adicionales
+    len := total_len - 7;
+    
+    IF len > 0 THEN
+        FOR i IN 1..len LOOP
+            DECLARE
+                rand_val DOUBLE PRECISION := RANDOM();
+            BEGIN
+                IF rand_val < 0.7 THEN
+                    others := others || CHR(FLOOR(RANDOM() * 26)::INT + 97);
+                ELSIF rand_val < 0.9 THEN
+                    others := others || CHR(FLOOR(RANDOM() * 26)::INT + 65);
+                ELSE
+                    others := others || CHR(FLOOR(RANDOM() * 10)::INT + 48);
+                END IF;
+            END;
+        END LOOP;
+    END IF;
+    
+    -- Concatenar componentes
+    generated_password := first_letter || second_digit || third_special_symbol || alphanumeric || others;
+    
+    RETURN SUBSTRING(generated_password FROM 1 FOR 20);
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE SCHEMA IF NOT EXISTS rh;
+
+CREATE TABLE IF NOT EXISTS rh.empleados (
+    id_empleado INT PRIMARY KEY,
+    nombre VARCHAR(100) NOT NULL,
+    salario DECIMAL(10,2) CHECK (salario >= 0),
+    fecha_contratacion DATE DEFAULT CURRENT_DATE,
+    departamento VARCHAR(50),
+    contrasena VARCHAR(20) DEFAULT generate_password(),
+    activo BOOLEAN DEFAULT TRUE
+);
+
+CREATE TABLE IF NOT EXISTS rh.auditoria_cambios (
+    id_auditoria SERIAL PRIMARY KEY,
+    tabla_afectada VARCHAR(50) NOT NULL,
+    operacion VARCHAR(10) NOT NULL,
+    usuario_bd VARCHAR(30) NOT NULL,
+    fecha_operacion TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    id_registro VARCHAR(100) NOT NULL,
+    valor_anterior TEXT,
+    valor_nuevo TEXT,
+    ip_conexion VARCHAR(45)
+);
+
+-- Procedimiento para agregar empleados
+CREATE OR REPLACE PROCEDURE rh.agregar_empleado(
+    p_id INT,
+    p_nombre VARCHAR(255),
+    p_salario DECIMAL(10,2),
+    p_departamento VARCHAR(50) DEFAULT NULL,
+    p_fecha_contratacion DATE DEFAULT NULL
+)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF p_salario < 0 THEN
+        RAISE EXCEPTION 'El salario no puede ser negativo';
+    ELSIF p_salario < 5000 OR p_salario > 30000 THEN
+        RAISE EXCEPTION 'Salario fuera del rango permitido (5000-30000)';
+    ELSE
+        INSERT INTO rh.empleados (id_empleado, nombre, salario, departamento, fecha_contratacion)
+        VALUES (p_id, p_nombre, p_salario, p_departamento, 
+               COALESCE(p_fecha_contratacion, CURRENT_DATE));
+        
+        RAISE NOTICE 'Empleado % agregado correctamente', p_nombre;
+    END IF;
+END;
+$$;
+
+-- Función para actualizar salarios
+CREATE OR REPLACE FUNCTION rh.actualizar_salario(
+    p_id_empleado INT,
+    p_aumento DECIMAL(10,2),
+    p_porcentaje BOOLEAN DEFAULT FALSE
+)
+RETURNS TEXT
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_salario_actual DECIMAL(10,2);
+    v_nuevo_salario DECIMAL(10,2);
+BEGIN
+    -- Obtener salario actual
+    SELECT salario INTO v_salario_actual
+    FROM rh.empleados
+    WHERE id_empleado = p_id_empleado;
+    
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Empleado no encontrado';
+    END IF;
+    
+    -- Calcular nuevo salario
+    IF p_porcentaje THEN
+        v_nuevo_salario := v_salario_actual * (1 + p_aumento/100);
+    ELSE
+        v_nuevo_salario := v_salario_actual + p_aumento;
+    END IF;
+    
+    -- Validar nuevo salario
+    IF v_nuevo_salario < 0 THEN
+        RAISE EXCEPTION 'El salario no puede ser negativo';
+    END IF;
+    
+    -- Actualizar salario
+    UPDATE rh.empleados
+    SET salario = v_nuevo_salario
+    WHERE id_empleado = p_id_empleado;
+    
+    RETURN 'Salario actualizado a ' || v_nuevo_salario;
+END;
+$$;
+
+-- Función para listar empleados
+CREATE OR REPLACE FUNCTION rh.listar_empleados(
+    p_departamento VARCHAR(50) DEFAULT NULL,
+    p_salario_min DECIMAL(10,2) DEFAULT 0,
+    p_salario_max DECIMAL(10,2) DEFAULT 30000
+)
+RETURNS TABLE (
+    id_empleado INT,
+    nombre VARCHAR(100),
+    salario DECIMAL(10,2),
+    departamento VARCHAR(50),
+    fecha_contratacion DATE
+)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF p_departamento IS NULL THEN
+        RETURN QUERY
+        SELECT e.id_empleado, e.nombre, e.salario, e.departamento, e.fecha_contratacion
+        FROM rh.empleados e
+        WHERE e.salario BETWEEN p_salario_min AND p_salario_max
+        AND e.activo = TRUE
+        ORDER BY e.nombre;
+    ELSE
+        RETURN QUERY
+        SELECT e.id_empleado, e.nombre, e.salario, e.departamento, e.fecha_contratacion
+        FROM rh.empleados e
+        WHERE e.departamento = p_departamento
+        AND e.salario BETWEEN p_salario_min AND p_salario_max
+        AND e.activo = TRUE
+        ORDER BY e.nombre;
+    END IF;
+END;
+$$;
+
+-- Función para calcular salario anual
+CREATE OR REPLACE FUNCTION rh.calcular_salario_anual(p_id_empleado INT)
+RETURNS DECIMAL(10,2)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_salario DECIMAL(10,2);
+BEGIN
+    SELECT salario INTO v_salario
+    FROM rh.empleados
+    WHERE id_empleado = p_id_empleado;
+    
+    IF NOT FOUND THEN
+        RETURN NULL;
+    ELSE
+        RETURN v_salario * 12;
+    END IF;
+END;
+$$;
+
+-- Función para trigger de auditoría de inserciones
+CREATE OR REPLACE FUNCTION rh.trg_auditoria_empleados_insert()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    INSERT INTO rh.auditoria_cambios (
+        tabla_afectada,
+        operacion,
+        usuario_bd,
+        id_registro,
+        valor_anterior,
+        valor_nuevo,
+        ip_conexion
+    )
+    VALUES (
+        'EMPLEADOS',
+        'INSERT',
+        CURRENT_USER,
+        NEW.id_empleado::VARCHAR,
+        NULL,
+        CONCAT('Nombre: ', NEW.nombre, 
+              ', Salario: ', NEW.salario,
+              ', Depto: ', COALESCE(NEW.departamento, 'N/A')),
+        COALESCE(inet_client_addr()::TEXT, 'Desconocida')
+    );
+    
+    RETURN NEW;
+END;
+$$;
+
+-- Función para trigger de auditoría de actualizaciones
+CREATE OR REPLACE FUNCTION rh.trg_auditoria_empleados_update()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF OLD.nombre IS DISTINCT FROM NEW.nombre OR 
+       OLD.salario IS DISTINCT FROM NEW.salario OR 
+       OLD.departamento IS DISTINCT FROM NEW.departamento OR 
+       OLD.activo IS DISTINCT FROM NEW.activo THEN
+        
+        INSERT INTO rh.auditoria_cambios (
+            tabla_afectada,
+            operacion,
+            usuario_bd,
+            id_registro,
+            valor_anterior,
+            valor_nuevo,
+            ip_conexion
+        )
+        VALUES (
+            'EMPLEADOS',
+            'UPDATE',
+            CURRENT_USER,
+            NEW.id_empleado::VARCHAR,
+            CONCAT('Nombre: ', OLD.nombre, 
+                  ', Salario: ', OLD.salario,
+                  ', Depto: ', COALESCE(OLD.departamento, 'N/A'),
+                  ', Activo: ', CASE WHEN OLD.activo THEN 'Sí' ELSE 'No' END),
+            CONCAT('Nombre: ', NEW.nombre, 
+                  ', Salario: ', NEW.salario,
+                  ', Depto: ', COALESCE(NEW.departamento, 'N/A'),
+                  ', Activo: ', CASE WHEN NEW.activo THEN 'Sí' ELSE 'No' END),
+            COALESCE(inet_client_addr()::TEXT, 'Desconocida')
+        );
+    END IF;
+    
+    RETURN NEW;
+END;
+$$;
+
+-- Función para trigger de auditoría de eliminaciones
+CREATE OR REPLACE FUNCTION rh.trg_auditoria_empleados_delete()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    INSERT INTO rh.auditoria_cambios (
+        tabla_afectada,
+        operacion,
+        usuario_bd,
+        id_registro,
+        valor_anterior,
+        valor_nuevo,
+        ip_conexion
+    )
+    VALUES (
+        'EMPLEADOS',
+        'DELETE',
+        CURRENT_USER,
+        OLD.id_empleado::VARCHAR,
+        CONCAT('Nombre: ', OLD.nombre, 
+              ', Salario: ', OLD.salario,
+              ', Depto: ', COALESCE(OLD.departamento, 'N/A'),
+              ', Activo: ', CASE WHEN OLD.activo THEN 'Sí' ELSE 'No' END),
+        NULL,
+        COALESCE(inet_client_addr()::TEXT, 'Desconocida')
+    );
+    
+    RETURN OLD;
+END;
+$$;
+
+-- Función para trigger de validación de salario
+CREATE OR REPLACE FUNCTION rh.trg_validar_salario()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF NEW.salario < 0 THEN
+        RAISE EXCEPTION 'El salario no puede ser negativo';
+    END IF;
+    
+    RETURN NEW;
+END;
+$$;
+
+-- Función para trigger de generación de contraseña
+CREATE OR REPLACE FUNCTION rh.trg_generar_contrasena()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF NEW.contrasena IS NULL THEN
+        NEW.contrasena := generate_password();
+    END IF;
+    
+    RETURN NEW;
+END;
+$$;
+
+-- Creación de los triggers
+CREATE TRIGGER trg_auditoria_empleados_insert
+AFTER INSERT ON rh.empleados
+FOR EACH ROW
+EXECUTE FUNCTION rh.trg_auditoria_empleados_insert();
+
+CREATE TRIGGER trg_auditoria_empleados_update
+AFTER UPDATE ON rh.empleados
+FOR EACH ROW
+EXECUTE FUNCTION rh.trg_auditoria_empleados_update();
+
+CREATE TRIGGER trg_auditoria_empleados_delete
+AFTER DELETE ON rh.empleados
+FOR EACH ROW
+EXECUTE FUNCTION rh.trg_auditoria_empleados_delete();
+
+CREATE TRIGGER trg_validar_salario
+BEFORE INSERT OR UPDATE ON rh.empleados
+FOR EACH ROW
+EXECUTE FUNCTION rh.trg_validar_salario();
+
+CREATE TRIGGER trg_generar_contrasena
+BEFORE INSERT ON rh.empleados
+FOR EACH ROW
+EXECUTE FUNCTION rh.trg_generar_contrasena();
+
+-- Agregar empleados
+CALL rh.agregar_empleado(1, 'Ambrosio Cardoso Jimenez', 10000, 'TI');
+CALL rh.agregar_empleado(2, 'Juan Climaco Rubio Cosme', 15000, 'Ventas');
+CALL rh.agregar_empleado(3, 'Rosa Lujan Martínez', 12000, 'RH');
+
+-- Actualizar salarios
+SELECT rh.actualizar_salario(1, 2000); -- Aumento fijo
+SELECT rh.actualizar_salario(2, 10, TRUE); -- Aumento porcentual (10%)
+
+-- Listar empleados
+SELECT * FROM rh.listar_empleados(); -- Todos los empleados
+SELECT * FROM rh.listar_empleados('TI'); -- Solo empleados de TI
+
+-- Usar funciones
+SELECT rh.calcular_salario_anual(1) AS salario_anual;
+
+-- Ver auditoría
+SELECT * FROM rh.auditoria_cambios ORDER BY fecha_operacion DESC;
